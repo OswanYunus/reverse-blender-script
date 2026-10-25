@@ -14,9 +14,20 @@ bl_info = {
 
 import bpy
 import json
+import os
 import time
 import urllib.request
 import urllib.error
+
+# Meshes with more vertices than this get written to a companion .ply file
+# instead of inline Python list literals - keeps the generated script small
+# and fast to open even when the scene has dense/sculpted/scanned geometry.
+LARGE_MESH_VERTEX_THRESHOLD = 20_000
+
+# Above this many TOTAL vertices across the generated selection, the operator
+# asks for confirmation before generating (purely a "this may take a moment
+# and write companion files" heads-up, not a hard limit).
+CONFIRM_VERTEX_THRESHOLD = 2_000_000
 
 # =========================================================================
 # 1. EXTRACTION
@@ -33,17 +44,18 @@ _MOD_PROP_SKIP = {
 }
 
 
-def _clean_modifier_props(mod):
-    """{prop_name: value} for one modifier, skipping read-only / internal props,
-    and reducing object/collection references down to their name (so the
-    generated script can re-look them up with bpy.data...)."""
+def _extract_rna_props(struct_obj, skip=frozenset()):
+    """{prop_name: value} for any RNA struct (a modifier, or a nested settings
+    block like a Cloth modifier's .settings), skipping read-only/internal
+    props, and reducing object/collection references down to their name (so
+    the generated script can re-look them up with bpy.data...)."""
     data = {}
-    for prop in mod.bl_rna.properties:
+    for prop in struct_obj.bl_rna.properties:
         pid = prop.identifier
-        if prop.is_readonly or pid in _MOD_PROP_SKIP:
+        if prop.is_readonly or pid in skip:
             continue
         try:
-            value = getattr(mod, pid)
+            value = getattr(struct_obj, pid)
         except Exception:
             continue
 
@@ -63,6 +75,31 @@ def _clean_modifier_props(mod):
             name = getattr(value, "name", None)
             if name is not None:
                 data[pid] = ("__ID_REF__", name)
+    return data
+
+
+# Physics-type modifiers keep their real parameters in a NESTED settings
+# struct (e.g. a Cloth modifier's mass/stiffness/damping live on
+# modifier.settings, not on the modifier itself). A flat property walk over
+# the modifier alone silently misses all of it - these are walked one level
+# deeper, explicitly, rather than guessed at generically.
+_NESTED_SETTINGS_PROPS = {
+    'CLOTH': ('settings', 'collision_settings'),
+    'SOFT_BODY': ('settings',),
+    'COLLISION': ('settings',),
+    'FLUID': ('domain_settings', 'flow_settings', 'effector_settings'),
+}
+
+
+def _clean_modifier_props(mod):
+    data = _extract_rna_props(mod, skip=_MOD_PROP_SKIP)
+    for nested_name in _NESTED_SETTINGS_PROPS.get(mod.type, ()):
+        nested_obj = getattr(mod, nested_name, None)
+        if nested_obj is None:
+            continue
+        nested_data = _extract_rna_props(nested_obj, skip={"rna_type", "name"})
+        if nested_data:
+            data[f"__NESTED__{nested_name}"] = nested_data
     return data
 
 
@@ -125,7 +162,7 @@ def extract_object(obj):
             "mesh_name": mesh.name,
             "vertices": [tuple(round(c, 6) for c in v.co) for v in mesh.vertices],
             "faces": [tuple(p.vertices) for p in mesh.polygons],
-            "use_smooth": any(p.use_smooth for p in mesh.polygons),
+            "use_smooth": [p.use_smooth for p in mesh.polygons],
         }
 
     return data
@@ -150,23 +187,78 @@ def _safe_var(name, prefix=""):
     return prefix + "".join(c if c.isalnum() else "_" for c in name)
 
 
-def _gen_mesh_block(obj_data, var):
+def _write_ply_ascii(filepath, vertices, faces):
+    """Writes geometry as a plain ASCII PLY file by hand (no bpy.ops export
+    operator involved) - sidesteps the fact that the ply import/export
+    operator names changed between Blender 3.x (import_mesh.ply /
+    export_mesh.ply) and 4.x (wm.ply_import / wm.ply_export)."""
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write("ply\nformat ascii 1.0\n")
+        f.write(f"element vertex {len(vertices)}\n")
+        f.write("property float x\nproperty float y\nproperty float z\n")
+        f.write(f"element face {len(faces)}\n")
+        f.write("property list uchar int vertex_indices\nend_header\n")
+        for v in vertices:
+            f.write(f"{v[0]} {v[1]} {v[2]}\n")
+        for face in faces:
+            f.write(f"{len(face)} " + " ".join(str(i) for i in face) + "\n")
+
+
+def _gen_mesh_geometry_block(obj_data, var, mesh_dir):
+    """Produces code that ends with a `{var}_mesh` bpy mesh datablock existing.
+    Small meshes: inline Python list literals (as before). Meshes over
+    LARGE_MESH_VERTEX_THRESHOLD, when mesh_dir is available: geometry is
+    written to a companion .ply file instead, written now as a side effect,
+    and the generated script imports it - keeps the .py text small and fast
+    to open even for dense/sculpted/scanned meshes."""
     mesh = obj_data["mesh"]
-    lines = [
-        f'# --- Mesh data for "{obj_data["name"]}" ---',
-        f'# Coordinates are LOCAL (object-space): the vertex positions before',
-        f'# the object\'s own location/rotation/scale below is applied to them.',
-        f'{var}_verts = {_fmt(mesh["vertices"])}',
-        f'{var}_faces = {_fmt(mesh["faces"])}',
-        f'{var}_mesh = bpy.data.meshes.new({_fmt(mesh["mesh_name"])})',
-        f'# from_pydata(verts, edges, faces) builds the mesh straight from raw',
-        f'# geometry - this is a literal reconstruction, not a guessed primitive.',
-        f'{var}_mesh.from_pydata({var}_verts, [], {var}_faces)',
-    ]
-    if mesh.get("use_smooth"):
-        lines.append(f'for poly in {var}_mesh.polygons:\n    poly.use_smooth = True')
-    lines.append(f'{var}_mesh.update()')
-    return "\n".join(lines)
+    verts, faces = mesh["vertices"], mesh["faces"]
+
+    if mesh_dir is None or len(verts) <= LARGE_MESH_VERTEX_THRESHOLD:
+        return "\n".join([
+            f'# --- Mesh data for "{obj_data["name"]}" ---',
+            f'# Coordinates are LOCAL (object-space): the vertex positions before',
+            f'# the object\'s own location/rotation/scale below is applied to them.',
+            f'{var}_verts = {_fmt(verts)}',
+            f'{var}_faces = {_fmt(faces)}',
+            f'{var}_mesh = bpy.data.meshes.new({_fmt(mesh["mesh_name"])})',
+            f'# from_pydata(verts, edges, faces) builds the mesh straight from raw',
+            f'# geometry - this is a literal reconstruction, not a guessed primitive.',
+            f'{var}_mesh.from_pydata({var}_verts, [], {var}_faces)',
+        ])
+
+    os.makedirs(mesh_dir, exist_ok=True)
+    safe_name = _safe_var(mesh["mesh_name"])
+    ply_path = os.path.join(mesh_dir, f"{safe_name}.ply")
+    _write_ply_ascii(ply_path, verts, faces)
+    return "\n".join([
+        f'# --- Mesh data for "{obj_data["name"]}" ({len(verts)} verts) ---',
+        f'# Too large for inline Python literals (keeps this script fast to open',
+        f'# and parse) - geometry stored in a companion .ply file instead. If you',
+        f'# move this script, move the "reverse_script_meshes" folder with it, or',
+        f'# fix the path below.',
+        f'{var}_ply_path = {_fmt(ply_path)}',
+        f'try:',
+        f'    bpy.ops.wm.ply_import(filepath={var}_ply_path)       # Blender 4.x',
+        f'except AttributeError:',
+        f'    bpy.ops.import_mesh.ply(filepath={var}_ply_path)     # Blender 3.x',
+        f'{var}_imported = bpy.context.selected_objects[-1]',
+        f'{var}_mesh = {var}_imported.data',
+        f'bpy.data.objects.remove({var}_imported, do_unlink=True)  # keep the mesh, drop the extra object',
+    ])
+
+
+def _gen_smooth_shading_block(obj_data, var):
+    smooth = obj_data["mesh"].get("use_smooth") or []
+    if not any(smooth):
+        return ""
+    return "\n".join([
+        f'# per-face smooth/flat shading, captured face-by-face so mixed',
+        f'# smooth-body / flat-hard-edge meshes come back exactly as they were.',
+        f'{var}_smooth = {_fmt(smooth)}',
+        f'for poly, is_smooth in zip({var}_mesh.polygons, {var}_smooth):',
+        f'    poly.use_smooth = is_smooth',
+    ])
 
 
 def _gen_transform_block(obj_data, var):
@@ -204,7 +296,21 @@ def _gen_modifier_block(obj_data, var):
     for mod in obj_data["modifiers"]:
         mvar = _safe_var(mod["name"], prefix=f"{var}_mod_")
         lines.append(f'{mvar} = {var}.modifiers.new(name={_fmt(mod["name"])}, type={_fmt(mod["type"])})')
+        if mod["type"] in _NESTED_SETTINGS_PROPS:
+            lines.append(f'# This is a physics setup, not a baked simulation: parameters below are')
+            lines.append(f'# restored, but you still need to play/bake the timeline in Blender to')
+            lines.append(f'# get matching per-frame motion - no cached simulation data is replayed.')
         for k, v in mod["props"].items():
+            if k.startswith("__NESTED__"):
+                nested_name = k[len("__NESTED__"):]
+                lines.append(f'{mvar}_{nested_name} = {mvar}.{nested_name}')
+                for nk, nv in v.items():
+                    if isinstance(nv, tuple) and len(nv) == 2 and nv[0] == "__ID_REF__":
+                        lines.append(f'# {nested_name}.{nk} referenced "{nv[1]}" in the original scene -')
+                        lines.append(f'# {mvar}_{nested_name}.{nk} = bpy.data.objects.get({_fmt(nv[1])})')
+                        continue
+                    lines.append(f'{mvar}_{nested_name}.{nk} = {_fmt(nv)}')
+                continue
             if isinstance(v, tuple) and len(v) == 2 and v[0] == "__ID_REF__":
                 lines.append(f'# {k} referenced "{v[1]}" in the original scene -')
                 lines.append(f'# re-link it manually if that object/collection exists here:')
@@ -238,7 +344,7 @@ def _gen_material_block(obj_data, var):
     return "\n".join(lines)
 
 
-def generate_script(scene_data):
+def generate_script(scene_data, mesh_dir=None):
     header = [
         '"""',
         "Auto-generated by Reverse Blender Script.",
@@ -248,8 +354,10 @@ def generate_script(scene_data):
         "transforms, modifiers, materials and parenting. Run in Blender's",
         "Text Editor (Alt+P) or: blender --background --python this_file.py",
         "",
-        "NOT captured in this version: geometry nodes, particle systems,",
-        "physics sims, drivers, shape keys, animation F-curves. Extend",
+        "NOT captured in this version: geometry nodes, particle systems/hair,",
+        "grass, fluid/smoke/cloth simulation CACHES (cloth/soft-body/collision",
+        "SETTINGS are captured - see the comment above each physics modifier",
+        "below), drivers, shape keys, animation F-curves. Extend",
         "extract_object()/generate_script() in the source add-on to add them.",
         '"""',
         "import bpy",
@@ -258,6 +366,11 @@ def generate_script(scene_data):
 
     body = []
     var_names = {}
+    mesh_var_by_dataname = {}  # mesh.name -> "{var}_mesh" python expression,
+                               # so linked-duplicate / instanced objects (e.g.
+                               # hundreds of grass/prop instances sharing one
+                               # mesh datablock) reuse it instead of each
+                               # re-emitting a full copy of the geometry.
 
     for i, obj_data in enumerate(scene_data):
         var = _safe_var(obj_data["name"], prefix=f"obj_{i}_")
@@ -268,8 +381,22 @@ def generate_script(scene_data):
         body.append("# " + "=" * 68)
 
         if obj_data["type"] == 'MESH' and obj_data["mesh"]:
-            body.append(_gen_mesh_block(obj_data, var))
-            body.append(f'{var} = bpy.data.objects.new({_fmt(obj_data["name"])}, {var}_mesh)')
+            mesh_name = obj_data["mesh"]["mesh_name"]
+            if mesh_name in mesh_var_by_dataname:
+                body.append(f'# "{mesh_name}" mesh data was already generated above for another')
+                body.append(f'# object - this one shares the same mesh datablock (a linked')
+                body.append(f'# duplicate/instance in the original scene), so its geometry is')
+                body.append(f'# reused instead of being duplicated again.')
+                mesh_expr = mesh_var_by_dataname[mesh_name]
+            else:
+                body.append(_gen_mesh_geometry_block(obj_data, var, mesh_dir))
+                smooth_code = _gen_smooth_shading_block(obj_data, var)
+                if smooth_code:
+                    body.append(smooth_code)
+                body.append(f'{var}_mesh.update()')
+                mesh_expr = f'{var}_mesh'
+                mesh_var_by_dataname[mesh_name] = mesh_expr
+            body.append(f'{var} = bpy.data.objects.new({_fmt(obj_data["name"])}, {mesh_expr})')
         else:
             body.append(f'# "{obj_data["type"]}" objects beyond MESH keep only their transform here -')
             body.append(f'# see the NOT-captured list in the file header for extension points.')
@@ -320,7 +447,7 @@ AI_SYSTEM_PROMPT = (
 )
 
 
-def ai_enhance_script(script_text, api_key, model="claude-3-5-sonnet-20241022"):
+def ai_enhance_script(script_text, api_key, model="claude-sonnet-5"):
     """POSTs the script to the Claude API for a comments-only pass.
     Requires the user's own Anthropic API key (set in add-on preferences).
     Raises on failure; caller decides how to surface that."""
@@ -359,7 +486,13 @@ class ReverseScriptPreferences(bpy.types.AddonPreferences):
         subtype='PASSWORD',
         default="",
     )
-    ai_model: bpy.props.StringProperty(name="Model", default="claude-3-5-sonnet-20241022")
+    ai_model: bpy.props.StringProperty(
+        name="Model",
+        default="claude-sonnet-5",
+        description="An Anthropic model ID. Check platform.claude.com/docs/about-claude/models "
+                     "if this ever starts erroring - Anthropic retires older dated snapshots "
+                     "roughly once a year, and the default here will eventually need updating too.",
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -386,14 +519,47 @@ class REVSCRIPT_OT_generate(bpy.types.Operator):
         default='SELECTED',
     )
 
+    def invoke(self, context, event):
+        objs = context.selected_objects if self.scope == 'SELECTED' else list(context.scene.objects)
+        total_verts = sum(len(o.data.vertices) for o in objs if o.type == 'MESH')
+        if total_verts > CONFIRM_VERTEX_THRESHOLD:
+            # Only (operator, event) is supported back to Blender 3.6's API -
+            # title/message kwargs were added later, so they're deliberately
+            # not used here to keep this working on the add-on's stated
+            # minimum version. The detail goes out via self.report instead.
+            self.report(
+                {'INFO'},
+                f"~{total_verts:,} vertices across {len(objs)} object(s) - "
+                f"confirm to continue, this may take a moment.",
+            )
+            return context.window_manager.invoke_confirm(self, event)
+        return self.execute(context)
+
     def execute(self, context):
         objs = context.selected_objects if self.scope == 'SELECTED' else list(context.scene.objects)
         if not objs:
             self.report({'WARNING'}, "Nothing to reverse-engineer: no objects selected / in scene.")
             return {'CANCELLED'}
 
+        mesh_dir = None
+        if bpy.data.filepath:
+            mesh_dir = os.path.join(os.path.dirname(bpy.data.filepath), "reverse_script_meshes")
+
         scene_data = extract_scene(objs)
-        script_text = generate_script(scene_data)
+
+        large_meshes = [
+            d["mesh"]["mesh_name"] for d in scene_data
+            if d.get("mesh") and len(d["mesh"]["vertices"]) > LARGE_MESH_VERTEX_THRESHOLD
+        ]
+        if large_meshes and mesh_dir is None:
+            self.report(
+                {'WARNING'},
+                f"{len(large_meshes)} large mesh(es) kept as inline literals - "
+                f"save the .blend file first to enable companion .ply export "
+                f"for meshes over {LARGE_MESH_VERTEX_THRESHOLD:,} verts.",
+            )
+
+        script_text = generate_script(scene_data, mesh_dir=mesh_dir)
 
         text_name = f"ReverseScript_{time.strftime('%Y%m%d_%H%M%S')}.py"
         text_block = bpy.data.texts.new(text_name)
